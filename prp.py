@@ -3049,5 +3049,15 @@ def main(argv=None) -> int:
     return 0
 
 
+def entry() -> None:
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:     # Ctrl+C at any prompt: leave quietly, no traceback
+        print()
+        sys.exit(130)
+    except BrokenPipeError:       # e.g. `prp history | head`
+        sys.exit(0)
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    entry()
