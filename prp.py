@@ -63,12 +63,19 @@ DEFAULT_CONFIG: dict = {
     "workspace": "auto",           # auto | in-place | worktree
     "auto_push": True,
     "reply_mode": "threads",       # threads | summary | none
-    "review_mode": "pending",      # pending | comment | local
+    "review_mode": "pending",      # pending (only you see it) | verdict (post: request changes / comment) | comment | local
     "rereview_on_push": False,
     "resolve_threads": False,      # after pushing a fix, resolve the review threads the agent addressed
     "rerequest_review": False,     # after pushing a fix, re-request review from the people who commented
     "watch_mentions": False,       # answer @mentions in issues/PRs of watched repos (optional)
     "mention_mode": "draft",       # draft (saved locally + notification) | reply (posted)
+    # Footer added to what prp posts. Placeholders: {agent} {commit} {me}. "" = no footer.
+    # (An invisible <!-- prp --> marker is always added so prp recognises its own comments.)
+    "signatures": {
+        "review": "🤖 drafted by prp ({agent})",
+        "reply": "🤖 via prp ({agent}) in {commit}",
+        "mention": "🤖 drafted by prp for @{me} while away ({agent})",
+    },
     "ignore_authors": [],
     "ignore_bots": False,
     "limit_cooldown_minutes": 60,
@@ -243,6 +250,13 @@ LIMIT_RE = re.compile(
 TRANSIENT_RE = re.compile(
     r"temporarily limiting requests|not your usage limit|overloaded|\b529\b|server error|"
     r"service unavailable|\b50[234]\b|connection (?:reset|refused|error)|timed? ?out", re.I)
+# The agent can't run at all as configured (wrong model for the plan, logged out, no access): don't retry
+# it on every job, tell the user once.
+SETUP_ERR_RE = re.compile(
+    r"not supported when using|not supported with (?:a |your )?|model .{0,60}(?:not found|not supported|"
+    r"not available|does not exist)|do(?:es)? not have access to (?:the )?model|not logged in|please (?:log ?in|"
+    r"run .{0,20}login)|login required|authentication (?:failed|required|error)|invalid api key|"
+    r"no active subscription|requires a (?:paid|plus|pro|team) ", re.I)
 DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 
 
@@ -515,6 +529,16 @@ def deep_merge(base: dict, over: dict) -> dict:
         else:
             out[k] = v
     return out
+
+
+def signature(cfg: dict, kind: str, agent: str = "", commit: str | None = None, me: str = "") -> str:
+    """Footer for a post (configurable in `signatures`), always ending with the invisible marker."""
+    tpl = str((cfg.get("signatures") or {}).get(kind, "") or "")
+    if not commit:  # drop " in {commit}"-style fragments when there's no commit
+        tpl = re.sub(r"\s*\b(?:in|at|@)\s+\{commit\}", "", tpl).replace("{commit}", "")
+    text = re.sub(r"\{(agent|commit|me)\}",
+                  lambda m: {"agent": agent, "commit": commit or "", "me": me}[m.group(1)], tpl).strip()
+    return (f"\n\n<sub>{text}</sub>" if text else "") + f"\n{MARKER}"
 
 
 def notify(title: str, text: str, cfg: dict) -> None:
@@ -915,11 +939,19 @@ Review guidelines (from the reviewer):
 {store.cfg['instructions'].get('review', '').strip()}
 {('Repo-specific guidelines for ' + repo['name'] + ':' + chr(10) + repo['instructions']['review'].strip()) if repo['instructions'].get('review') else ''}
 
+How to write the review:
+- Put every finding as an inline comment on the exact changed line it is about.
+- Keep each comment concise: 1-3 sentences saying what is wrong and the concrete fix. No praise, no
+  restating the code, no headings.
+- Keep the summary to 2-4 sentences. Don't repeat the inline comments in it.
+- verdict: "request_changes" if any comment is a bug, security, data-loss or correctness problem that should
+  be fixed before merging; "comment" if you only have suggestions or questions; "approve" if you found nothing.
+
 End your answer with exactly one fenced JSON block:
 ```json
-{{"summary": "markdown overview: what the PR does, main risks, verdict",
+{{"summary": "2-4 sentences: what the PR does and the main risk",
   "verdict": "approve | comment | request_changes",
-  "comments": [{{"path": "file/path", "line": 123, "body": "comment"}}]}}
+  "comments": [{{"path": "file/path", "line": 123, "body": "concise comment"}}]}}
 ```
 `line` is the line number in the NEW version of the file and must be a line that appears in the diff.
 """
@@ -1233,6 +1265,19 @@ def run_agents(store: Store, order: list[str], kind: str, cwd: Path, prompt: str
             meta["stopped"] = "max turns" if meta["subtype"] == "error_max_turns" else "max budget"
             log(f"  {name} stopped at its {meta['stopped']} limit after {int(time.time() - t0)}s", "warn")
             return name, text, meta
+        if failed and SETUP_ERR_RE.search(err_text):
+            msg = next((ln.strip() for ln in err_text.splitlines() if SETUP_ERR_RE.search(ln)), err_text.strip())[:200]
+            attempt["status"] = "unavailable"
+            store.cool(name, time.time() + 6 * 3600)
+            with store.lock:
+                store.state.setdefault("unavailable", {})[name] = {"reason": msg, "at": time.time()}
+                store.save_state()
+            errors.append(f"{name}: {msg}")
+            log(f"  {name} can't run with its current setup: {msg}", "warn")
+            log(f"  skipping {name} for 6h. Fix its config, or remove it: prp settings (fix_agents / review_agents). "
+                f"`prp cooldown-reset` retries it now.", "dim")
+            notify(f"prp: {name} can't run", msg, store.cfg)
+            continue
         if failed:
             transient = bool(TRANSIENT_RE.search(err_text))
             attempt["status"] = "timeout" if rc == -1 else ("transient" if transient else "failed")
@@ -1334,6 +1379,8 @@ class Pilot:
         self.job: dict = {}
         self._notif_broken = False
         self._searched = False         # always search once when prp starts
+        self.last_poll = 0.0
+        self.next_poll = 0.0
         self.min_interval = 0          # GitHub's X-Poll-Interval for the notifications feed
 
     # -------- polling
@@ -1527,7 +1574,7 @@ class Pilot:
         mode = self.cfg.get("mention_mode", "draft")
         where = f"drafted in {md}"
         if replies and mode == "reply" and not self.dry_run:
-            sig = f"\n\n<sub>🤖 drafted by prp for @{self.me} while away ({agent})</sub>\n{MARKER}"
+            sig = signature(self.cfg, "mention", agent, me=self.me)
             loose = []
             for it, reply in replies:
                 if it["id"].startswith("rc:"):
@@ -1895,7 +1942,7 @@ class Pilot:
         name, n = repo["name"], pr["number"]
         replies = {r.get("id"): (r.get("reply") or "").strip() for r in data.get("replies", []) if isinstance(r, dict)}
         by_id = {it["id"]: it for it in items}
-        sig = f"\n\n<sub>🤖 via prp ({agent}){' in ' + sha if sha else ''}</sub>\n{MARKER}"
+        sig = signature(self.cfg, "reply", agent, commit=sha, me=self.me)
         leftovers = []
         posted_roots = set()
         for iid, reply in replies.items():
@@ -1963,31 +2010,47 @@ class Pilot:
                       + "\n".join(f"- `{cm['path']}:{cm['line']}` {cm['body']}" for cm in comments) + "\n")
         mode = self.cfg.get("review_mode", "pending")
         where = f"saved to {md}"
-        if mode in ("pending", "comment") and not self.dry_run:
-            body = f"{summary}\n\n<sub>🤖 drafted by prp ({agent})</sub>\n{MARKER}"
+        if mode in ("pending", "comment", "verdict") and not self.dry_run:
+            body = f"{summary}{signature(self.cfg, 'review', agent, me=self.me)}"
             payload = {"commit_id": sha, "body": body,
                        "comments": [{"path": cm["path"], "line": cm["line"], "side": "RIGHT", "body": cm["body"]}
                                     for cm in comments]}
+            verdict = str(data.get("verdict", "")).lower().replace(" ", "_")
             if mode == "comment":
                 payload["event"] = "COMMENT"
+            elif mode == "verdict":
+                # never auto-approve: an approval from an agent shouldn't unblock a merge
+                payload["event"] = "REQUEST_CHANGES" if verdict == "request_changes" and comments else "COMMENT"
             try:
                 try:
-                    gh_api(f"repos/{name}/pulls/{n}/reviews", "POST", payload)
+                    created = gh_api(f"repos/{name}/pulls/{n}/reviews", "POST", payload) or {}
                 except CmdError:
                     # usually a comment on a line outside the diff: fold comments into the body
                     payload["body"] = body.replace(MARKER, "") + "\n\n" + "\n".join(
                         f"- `{cm['path']}:{cm['line']}` {cm['body']}" for cm in comments) + "\n" + MARKER
                     payload["comments"] = []
-                    gh_api(f"repos/{name}/pulls/{n}/reviews", "POST", payload)
-                where = "left as a pending review (submit it on GitHub)" if mode == "pending" else "posted as a comment review"
+                    created = gh_api(f"repos/{name}/pulls/{n}/reviews", "POST", payload) or {}
+                self.job.update(review_id=created.get("id"), review_url=created.get("html_url"),
+                                verdict=data.get("verdict"), comments=len(comments))
+                where = ("pending review" if mode == "pending" else
+                         "posted: changes requested" if payload.get("event") == "REQUEST_CHANGES" else
+                         "posted as a comment review")
             except CmdError as e:
                 log(f"{name}#{n}: couldn't create review on GitHub ({e}); kept locally", "warn")
         with self.store.lock:
             self.store.state["reviewed"][f"{name}#{n}"] = pr["head"]["sha"]
             self.store.save_state()
-        log(f"{name}#{n}: review by {agent} {where}", "ok")
         self.job.update(result="ok", agent=agent, where=where)
-        notify(f"prp: reviewed {name}#{n}", f"{agent}: {where}", self.cfg)
+        if where == "pending review":
+            log(f"{name}#{n}: {agent} drafted a review ({len(comments)} line comment(s)). It's PENDING: only you "
+                f"can see it until it's submitted.", "ok")
+            log(f"  publish it: prp submit {self.job['id']}   (or Submit review on GitHub: {pr.get('html_url', '')}"
+                "/files)   always post automatically: prp settings -> review_mode verdict", "dim")
+            notify(f"prp: review ready for {name}#{n}", f"Pending, only you can see it. prp submit {self.job['id']}",
+                   self.cfg)
+        else:
+            log(f"{name}#{n}: review by {agent} {where}", "ok")
+            notify(f"prp: reviewed {name}#{n}", f"{agent}: {where}", self.cfg)
 
     # -------- status
     def status_lines(self) -> list[str]:
@@ -1995,9 +2058,21 @@ class Pilot:
         for a in sorted(set(self.cfg["fix_agents"]) | set(self.cfg["review_agents"])):
             ok = shutil.which(self.cfg["agents"].get(a, {}).get("bin", a))
             cool = self.store.cooled_until(a) - time.time()
-            s = "missing" if not ok else (f"cooling down {int(cool / 60)}m" if cool > 0 else "ready")
+            un = (self.store.state.get("unavailable") or {}).get(a)
+            if not ok:
+                s = "missing"
+            elif cool > 0 and un and time.time() - un.get("at", 0) < 6 * 3600 + 60:
+                s = f"unavailable: {un['reason'][:70]}"
+            else:
+                s = f"cooling down {int(cool / 60)}m" if cool > 0 else "ready"
             out.append(f"  {a:<8} {s}")
         out.append(f"  running: {self.current or '-'}   queued: {self.jobs.qsize()}")
+        if self.last_poll:
+            nxt = int(self.next_poll - time.time())
+            rate = http_cache().rate
+            out.append(f"  last check: {int(time.time() - self.last_poll)}s ago   next: "
+                       + (f"in {nxt}s" if nxt > 0 else "now")
+                       + (f"   GitHub API left: {rate['remaining']}/{rate['limit']}" if rate.get("remaining") else ""))
         out += history_lines(self.store.state["history"][-5:])
         return out
 
@@ -2047,9 +2122,120 @@ def start_caffeinate(cfg: dict) -> subprocess.Popen | None:
     return subprocess.Popen(["caffeinate", flags, "-w", str(os.getpid())])
 
 
+class RunLock:
+    """One monitor per machine. An OS file lock (flock) is released automatically if prp crashes,
+    so a stale lock can't block you."""
+
+    def __init__(self):
+        self.path = HOME / "run.lock"
+        self.fh = None
+
+    def acquire(self) -> bool:
+        import fcntl
+        fh = open(self.path, "a+")
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            fh.close()
+            return False
+        try:
+            tty = os.ttyname(sys.stdin.fileno()) if sys.stdin.isatty() else ""
+        except OSError:
+            tty = ""
+        fh.seek(0)
+        fh.truncate()
+        json.dump({"pid": os.getpid(), "started": now_utc().isoformat(timespec="seconds"),
+                   "cwd": os.getcwd(), "tty": tty}, fh)
+        fh.flush()
+        self.fh = fh
+        return True
+
+    def release(self):
+        if self.fh:
+            import fcntl
+            try:
+                self.fh.seek(0)
+                self.fh.truncate()
+                fcntl.flock(self.fh, fcntl.LOCK_UN)
+            finally:
+                self.fh.close()
+                self.fh = None
+
+    @staticmethod
+    def holder() -> dict | None:
+        """Who holds the lock, or None if no monitor is running."""
+        import fcntl
+        path = HOME / "run.lock"
+        if not path.exists():
+            return None
+        with open(path, "a+") as fh:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                fh.seek(0)
+                try:
+                    return json.loads(fh.read() or "{}") or {"pid": None}
+                except ValueError:
+                    return {"pid": None}
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            return None
+
+
+def describe_holder(info: dict) -> str:
+    bits = [f"pid {info.get('pid')}"]
+    if info.get("started"):
+        bits.append(f"since {_local(info['started'])}")
+    if info.get("tty"):
+        bits.append(f"in {info['tty']}")
+    if info.get("cwd"):
+        bits.append(f"started from {info['cwd']}")
+    return ", ".join(bits)
+
+
+def cmd_stop(wait: float = 0) -> int:
+    info = RunLock.holder()
+    if not info:
+        print("prp isn't running.")
+        return 0
+    if not info.get("pid"):
+        print(c("A prp monitor holds the lock but its pid is unknown; stop it from its terminal.", "33"))
+        return 1
+    try:
+        os.kill(int(info["pid"]), signal.SIGTERM)
+    except ProcessLookupError:
+        print("prp isn't running.")
+        return 0
+    except PermissionError as e:
+        print(c(f"Can't stop pid {info['pid']}: {e}", "31"))
+        return 1
+    print(f"Asked prp ({describe_holder(info)}) to stop. It finishes the job it's on first.")
+    end = time.time() + wait
+    while wait and time.time() < end and RunLock.holder():
+        time.sleep(0.5)
+    return 0
+
+
 def cmd_run(store: Store, once=False, dry_run=False, no_caffeinate=False) -> int:
     if not preflight(store, quiet=True):
         return 1
+    lock = None
+    if not dry_run:
+        lock = RunLock()
+        if not lock.acquire():
+            info = RunLock.holder() or {}
+            print(c("prp is already running", "33") + f" ({describe_holder(info)}).")
+            print("Only one monitor runs at a time; it already watches every repo in your config "
+                  "and picks up `prp add` changes.")
+            print(c("Stop it with `prp stop` (or q in its terminal) if you want to restart it.", "2"))
+            return 1
+    try:
+        return _run(store, once, dry_run, no_caffeinate)
+    finally:
+        if lock:
+            lock.release()
+
+
+def _run(store: Store, once=False, dry_run=False, no_caffeinate=False) -> int:
     if not once:
         offer_cwd_repo(store)
     pilot = Pilot(store, dry_run=dry_run)
@@ -2079,17 +2265,32 @@ def cmd_run(store: Store, once=False, dry_run=False, no_caffeinate=False) -> int
     print(c("  (`prp add` in another terminal works too; picked up on the next check)", "2"))
     worker = threading.Thread(target=pilot.worker, daemon=True)
     worker.start()
-    paused, next_poll = False, 0.0
+    paused, next_poll, interrupted, manual = False, 0.0, False, False
     signal.signal(signal.SIGTERM, lambda *_: pilot.stop.set())
     try:
         with KeyReader() as keys:
             while not pilot.stop.is_set():
-                if not paused and time.time() >= next_poll:
+                if (not paused and time.time() >= next_poll) or manual:
+                    queued_before, t0 = set(pilot.active), time.time()
+                    calls0, free0 = http_cache().stats["requests"], http_cache().stats["not_modified"]
                     try:
                         pilot.poll()
                     except Exception as e:  # noqa: BLE001
                         log(f"poll error: {e}", "err")
+                    pilot.last_poll = time.time()
                     next_poll = time.time() + max(float(store.cfg["poll_interval"]), pilot.min_interval)
+                    pilot.next_poll = next_poll
+                    if manual:   # an explicit check always says what it found
+                        new = len(pilot.active - queued_before)
+                        calls = http_cache().stats["requests"] - calls0
+                        free = http_cache().stats["not_modified"] - free0
+                        nrepos = sum(1 for r in store.cfg["repos"] if r.get("enabled", True))
+                        log(f"Checked {nrepos} repo(s) in {time.time() - t0:.1f}s: "
+                            + (f"{new} new job(s) queued" if new else "nothing new")
+                            + f" · {calls} GitHub request(s), {free} unchanged"
+                            + (" · still paused (p to resume)" if paused
+                               else f" · next check in {int(next_poll - time.time())}s"), "ok")
+                        manual = False
                 k = keys.read(1.0)
                 if not k:
                     continue
@@ -2107,7 +2308,8 @@ def cmd_run(store: Store, once=False, dry_run=False, no_caffeinate=False) -> int
                         log(f"Now watching {sum(1 for r in store.cfg['repos'] if r.get('enabled', True))} repo(s)", "ok")
                         next_poll = 0
                 elif k == "n":
-                    next_poll = 0
+                    log("Checking now...", "dim")
+                    manual = True
                 elif k == "p":
                     paused = not paused
                     log("paused" if paused else "resumed", "warn")
@@ -2117,8 +2319,17 @@ def cmd_run(store: Store, once=False, dry_run=False, no_caffeinate=False) -> int
     except KeyboardInterrupt:
         print()
         log("Interrupted.", "warn")
+        interrupted = True
     finally:
         pilot.stop.set()
+        if pilot.current and not interrupted:   # `prp stop` / SIGTERM: let the running job finish
+            log(f"Stopping after {pilot.current} finishes (Ctrl+C to abort)...", "warn")
+            try:
+                while pilot.current:
+                    time.sleep(0.5)
+            except KeyboardInterrupt:
+                pass
+        log("prp stopped.", "dim")
         if caf:
             caf.terminate()
     return 0
@@ -2377,7 +2588,8 @@ SETTINGS = [
     ("workspace", "Workspace: auto (your checkout if clean, else worktree) / in-place / worktree", str),
     ("auto_push", "Push fixes automatically", bool),
     ("reply_mode", "Replies: threads / summary / none", str),
-    ("review_mode", "Reviews: pending (draft only you see) / comment / local", str),
+    ("review_mode", "Reviews: pending (only you see it) / verdict (post; request changes when it found real "
+                    "problems) / comment / local", str),
     ("rereview_on_push", "Review again when the PR gets new commits", bool),
     ("watch_mentions", "Answer @mentions in issues/PRs of watched repos", bool),
     ("mention_mode", "Mention answers: draft (saved locally, you post) / reply (posted for you)", str),
@@ -2398,6 +2610,11 @@ SETTINGS = [
 
 def cmd_settings(store: Store) -> int:
     cfg = store.cfg
+    print(c("Footers on what prp posts ({agent} {commit} {me}; '-' for none):", "2"))
+    for kind, label in (("review", "Review footer"), ("reply", "Reply footer"), ("mention", "Mention footer")):
+        cur = cfg["signatures"].get(kind, "")
+        v = ask(f"{label}", cur or "-")
+        cfg["signatures"][kind] = "" if v.strip() == "-" else v
     for key, label, typ in SETTINGS:
         cur = cfg[key]
         if typ is bool:
@@ -2448,7 +2665,10 @@ def preflight(store: Store, quiet=False) -> bool:
 
 def cmd_status(store: Store) -> int:
     p = Pilot(store)
-    print(c("Agents", "1"))
+    info = RunLock.holder()
+    print(c("Monitor", "1"))
+    print(f"  {c('running', '32')} ({describe_holder(info)})" if info else "  not running  (start: prp run)")
+    print(c("\nAgents", "1"))
     print("\n".join(p.status_lines()[:len(set(store.cfg["fix_agents"]) | set(store.cfg["review_agents"]))]))
     print(c("\nRecent jobs", "1"))
     cmd_history(store, limit=10)
@@ -2471,7 +2691,11 @@ def _outcome(h: dict) -> str:
         return "committed locally" if h.get("commit") else "replied, no code change"
     if r == "ok":
         w = str(h.get("where", ""))
-        return "pending review" if "pending" in w else ("saved locally" if "saved" in w or "drafted" in w else w)
+        if h.get("submitted"):
+            return f"review submitted ({h['submitted'].lower().replace('_', ' ')})"
+        if "pending" in w:
+            return "pending review" + (c(f" → prp submit {h['id']}", "2") if h.get("review_id") else "")
+        return "saved locally" if "saved" in w or "drafted" in w else w
     if r == "error":
         return "error: " + str(h.get("error", ""))[:40]
     if r == "held":
@@ -2531,6 +2755,38 @@ def cmd_push(store: Store, ident: str) -> int:
         job.pop("pending", None)
         store.save_state()
     print(c(f"Pushed {sha} and posted replies on {job['repo']}#{job['number']}.", "32"))
+    return 0
+
+
+def cmd_submit(store: Store, ident: str, event: str = "comment") -> int:
+    """Publish a pending review prp drafted (GitHub keeps pending reviews visible only to you)."""
+    if not ident:
+        waiting = [h for h in store.state["history"] if h.get("review_id") and not h.get("submitted")
+                   and h.get("where") == "pending review"]
+        print("\n".join(history_lines(waiting)) if waiting else "No pending reviews from prp.")
+        return 0
+    job = _one_job(store, ident)
+    if not job:
+        return 1
+    if not job.get("review_id"):
+        print(c(f"Job {job['id']} has no pending review to submit (result: {_outcome(job)}).", "31"))
+        return 1
+    if job.get("submitted"):
+        print(f"Already submitted ({job['submitted']}).")
+        return 0
+    ev = {"comment": "COMMENT", "request-changes": "REQUEST_CHANGES", "approve": "APPROVE"}[event]
+    try:
+        gh_api(f"repos/{job['repo']}/pulls/{job['number']}/reviews/{job['review_id']}/events", "POST", {"event": ev})
+    except CmdError as e:
+        print(c(f"GitHub refused: {e}\nIt may already be submitted or deleted on GitHub.", "31"))
+        return 1
+    with store.lock:
+        job["submitted"] = ev
+        store.save_state()
+    print(c(f"Submitted the review on {job['repo']}#{job['number']} as {event}"
+            + (f" ({job['comments']} line comment(s))" if job.get("comments") else "") + ".", "32"))
+    if job.get("url"):
+        print(c(f"  {job['url']}", "2"))
     return 0
 
 
@@ -2661,6 +2917,9 @@ def cmd_init(store: Store) -> int:
     store.cfg["push_mode"] = "approve" if not ask_yes(
         "Push fixes automatically when safety checks pass? (No = always wait for `prp push <id>`)",
         store.cfg["push_mode"] != "approve") else "auto"
+    rm = ask("Reviews on teammates' PRs: post them for you, or keep them pending (only you see them) until "
+             "you run `prp submit`? (post/pending)", "post" if store.cfg["review_mode"] in ("comment", "verdict") else "pending")
+    store.cfg["review_mode"] = "verdict" if rm.lower().startswith("po") else "pending"
     store.cfg["resolve_threads"] = ask_yes("After a fix is pushed, resolve the review threads it addressed?",
                                            store.cfg["resolve_threads"])
     store.cfg["rerequest_review"] = ask_yes("After a fix is pushed, re-request review from the commenters?",
@@ -2738,11 +2997,15 @@ def main(argv=None) -> int:
     op.add_argument("--print", dest="print_only", action="store_true", help="only print the command")
     pp = sub.add_parser("push", help="approve a held fix: push it and post its replies (no id: list held)")
     pp.add_argument("id", nargs="?", default="")
+    sp = sub.add_parser("submit", help="publish a pending review prp drafted (no id: list them)")
+    sp.add_argument("id", nargs="?", default="")
+    sp.add_argument("--event", choices=["comment", "request-changes", "approve"], default="comment")
     dp = sub.add_parser("discard", help="drop a held fix")
     dp.add_argument("id")
     sub.add_parser("prompts", help="edit default instructions for fixing and reviewing")
     sub.add_parser("settings", help="edit settings interactively")
-    sub.add_parser("status", help="agent cooldowns and recent jobs")
+    sub.add_parser("status", help="whether prp is running, agent availability, recent jobs")
+    sub.add_parser("stop", help="stop the running monitor (after its current job)")
     sub.add_parser("doctor", help="check gh, agents and repo paths")
     sub.add_parser("cooldown-reset", help="mark all agents as available again")
     a = ap.parse_args(argv)
@@ -2763,6 +3026,8 @@ def main(argv=None) -> int:
         return cmd_open(store, a.id, a.agent, a.print_only)
     if a.cmd == "push":
         return cmd_push(store, a.id)
+    if a.cmd == "submit":
+        return cmd_submit(store, a.id, a.event)
     if a.cmd == "discard":
         return cmd_discard(store, a.id)
     if a.cmd == "prompts":
@@ -2771,10 +3036,13 @@ def main(argv=None) -> int:
         return cmd_settings(store)
     if a.cmd == "status":
         return cmd_status(store)
+    if a.cmd == "stop":
+        return cmd_stop(wait=30)
     if a.cmd == "doctor":
         return 0 if preflight(store) else 1
     if a.cmd == "cooldown-reset":
         store.state["cooldown"] = {}
+        store.state["unavailable"] = {}
         store.save_state()
         print("All agents marked available.")
         return 0

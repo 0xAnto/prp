@@ -27,7 +27,7 @@ prp 0.1.0  watching 4 repo(s) as @you
 | When… | prp… |
 |---|---|
 | Someone reviews **your** PR | applies GitHub `suggestion` blocks directly, has an agent handle the rest, commits, pushes to the PR branch, and replies in each thread |
-| Someone **requests your review** | has an agent review the diff and leaves it as a **pending** review that only you can see until you submit it |
+| Someone **requests your review** | has an agent review the diff with concise inline comments, then either posts it (**Request changes** when it found real problems, **Comment** otherwise; never approves) or leaves it **pending** for you to submit |
 | Someone **@mentions** you *(optional)* | drafts an answer from the code and the thread, saved locally or posted (your choice) |
 
 ## Why run it locally
@@ -35,7 +35,10 @@ prp 0.1.0  watching 4 repo(s) as @you
 - **Your machine, your setup.** Agents run in your real checkout, with your `CLAUDE.md` / `AGENTS.md`,
   project settings, dependencies and toolchain. No CI runners and no GitHub App to install.
 - **Your subscriptions.** It calls the `claude` and `codex` CLIs you're already logged in to. No API keys needed.
-- **Falls back when a limit is hit.** If one agent reports a usage or rate limit, the next one takes over.
+- **Falls back when a limit is hit.** If one agent reports a usage limit, the next one takes over until the
+  first one's limit resets. Agents that are close to their limit are tried last.
+- **Cheap to leave running.** It checks every minute, and unchanged data comes back as `304 Not Modified`,
+  which GitHub doesn't count against your rate limit.
 
 ## Requirements
 
@@ -75,21 +78,25 @@ prp add ~/code/api ~/code/web
 prp add ~/code                  # lists the checkouts inside; pick which to watch
 ```
 
-While `prp run` is going, press `a` to add a repo, or run `prp add` in another terminal. The running
-monitor picks it up on its next check. On macOS, prp runs `caffeinate` while it's watching so the
+Settings and the repo list are machine-wide (`~/.prp/config.json`), so `prp run` from any folder watches
+every repo you've added. Only one monitor runs at a time. A second `prp run` tells you where the first one is
+running instead of starting. While `prp run` is going, press `a` to add a repo, or run `prp add` in another
+terminal. The running monitor picks it up on its next check. On macOS, prp runs `caffeinate` while it's watching so the
 machine doesn't idle-sleep. A laptop on battery with the lid closed will still sleep.
 
 ## How it works
 
 ```
-every poll_interval (default 2 min)
- ├─ list open PRs per repo ─── PR unchanged since last look? ── skip (no further API calls)
- │                              └─ read new comments → triage ─┬─ skip        (no model)
- │                                                             ├─ suggestion  (applied as a patch, no model)
- │                                                             ├─ light       (small model / low effort)
- │                                                             └─ full        (default model)
- ├─ search: review-requested:@you → size the diff → light / full review, lockfile-only PRs skipped
- └─ search: mentions:@you (optional)
+every minute (all GETs are conditional: unchanged = 304, free)
+ ├─ list open PRs per repo ─── PR unchanged since last look? ── skip
+ │                              └─ read new comments → trusted author? → triage ─┬─ skip        (no model)
+ │                                                                               ├─ suggestion  (applied as a patch)
+ │                                                                               ├─ light       (small model / low effort)
+ │                                                                               └─ full        (default model)
+ ├─ notifications feed (one call for all repos) says a review was requested / you were mentioned?
+ │   ├─ search: review-requested:@you → size the diff → light / full review, lockfile-only PRs skipped
+ │   └─ search: mentions:@you (optional)
+ └─ fix ready → safety checks → push (or hold for `prp push <id>`) → reply → resolve / re-request (optional)
 ```
 
 **Triage is rule-based** and costs nothing. It skips "LGTM", thanks, emoji, approvals, CI and deploy bots,
@@ -100,7 +107,9 @@ been quiet for `settle_seconds`, so a whole review becomes one agent run.
 and your instructions. This is the same agent, with the same tools and project context, as the interactive
 apps. It just can't stop to wait for a person, and it exits when done. **Agents never commit or push.** prp does that after the agent finishes, so every
 change goes through the same path. If the push is rejected because the branch moved, the commit is kept on a
-local `prp/pr-N-unpushed` branch and you get a notification.
+local `prp/pr-N-unpushed` branch and you get a notification. If an agent hits `max_turns`, nothing is pushed:
+the partial work is kept on `prp/pr-N-partial` and the job is marked *needs you*, so you can pick it up with
+`prp open <id>`.
 
 **Every run can be picked up interactively.** Each job gets a short id. prp records the Claude Code /
 Codex session id of every agent run, so when you're back you can reopen the agent's conversation in
@@ -147,13 +156,17 @@ prp                         interactive menu (offers to add the repo you're in)
 prp init                    guided setup
 prp add [paths...]          watch the current repo, or the checkouts / folders given
 prp run [--once] [--dry-run] [--no-caffeinate]
+prp stop                    stop the running monitor (it finishes its current job first)
 prp history [filter]        past jobs and their agent sessions (--sessions for every attempt)
 prp open [id]               reopen a job's Claude Code / Codex session interactively
+prp submit [id] [--event comment|request-changes|approve]   publish a pending review prp drafted
+prp push [id]               approve a held fix: push it and post its replies (no id: list held fixes)
+prp discard <id>            drop a held fix
 prp repos                   list watched repos
 prp repos edit|rm|on|off owner/repo
 prp prompts                 edit default instructions
 prp settings                edit settings
-prp status                  agent availability and recent jobs
+prp status                  whether prp is running, agent availability, recent jobs
 prp doctor                  check gh, agents and repo paths
 prp cooldown-reset          mark all agents available again
 ```
@@ -164,15 +177,23 @@ Everything lives in `~/.prp/config.json` (set `PRP_HOME` to move it). The main s
 
 | Setting | Default | |
 |---|---|---|
-| `poll_interval` | `120` | seconds between checks |
+| `poll_interval` | `60` | seconds between checks |
 | `settle_seconds` | `90` | wait until the reviewer has been quiet this long |
 | `fix_agents` / `review_agents` | `claude,codex` / `codex,claude` | tried in order; the next one is used if one hits its limit |
 | `workspace` | `auto` | `auto`, `in-place` or `worktree` |
 | `auto_push` | `true` | push fixes to the PR branch |
 | `reply_mode` | `threads` | `threads`, `summary` or `none` |
-| `review_mode` | `pending` | `pending` (only you see it), `comment` or `local` |
+| `review_mode` | `pending` | `pending` (only you see it; publish with `prp submit`), `verdict` (post as Request changes / Comment), `comment`, or `local` |
 | `watch_mentions` / `mention_mode` | `false` / `draft` | answer @mentions; `draft` or `reply` |
-| `limit_cooldown_minutes` | `60` | how long to skip an agent after it hits a limit |
+| `trusted_associations` | `OWNER,MEMBER,COLLABORATOR` | whose comments prp acts on |
+| `trusted_authors` | none | extra logins to act on, e.g. `coderabbitai[bot]` |
+| `push_mode` | `auto` | `auto` (push when safety checks pass) or `approve` (always hold) |
+| `gates` | see below | limits that make prp hold a push for approval |
+| `resolve_threads` / `rerequest_review` | `false` / `false` | after a pushed fix, resolve addressed threads / re-request review |
+| `max_turns` / `max_budget_usd` | `60` / none | per-run limits for Claude Code |
+| `routing` / `usage_threshold_percent` | `order` / `90` | `balance` puts the agent with the most remaining usage first |
+| `signatures` | `review`, `reply`, `mention` footers | text added under what prp posts; placeholders `{agent}` `{commit}` `{me}`; `""` for none |
+| `limit_cooldown_minutes` | `60` | how long to skip an agent after a limit, when the reset time isn't known |
 
 Agent command lines are templates under `agents` in the config, so you can adjust flags or models
 without touching the code. Placeholders: `{bin}` `{prompt}` `{cwd}` `{out}` `{allowed_tools}` `{light_args}`
@@ -183,11 +204,32 @@ State, logs and copies of every review and mention answer are kept under `~/.prp
 
 ## Safety
 
+prp acts on text written by other people, so it treats that text as untrusted. Prompt injection through
+PR comments and issues is a real attack on coding agents.
+
+- **Trusted authors only.** prp acts on comments from repo owners, members and collaborators (GitHub's
+  `author_association`), plus logins you list in `trusted_authors`. Bots are untrusted unless you list them.
+  Everything else is skipped and logged.
+- **Hidden text is stripped.** HTML comments, zero-width, bidi and Unicode tag characters are removed before
+  a model sees a comment. Comments go in the prompt inside `<untrusted>` tags, with instructions to treat
+  them as data.
+- **Agents don't get your tokens.** `GH_TOKEN`, `GITHUB_TOKEN`, npm, PyPI and AWS secrets are removed from the
+  agent's environment. prp, not the agent, pushes.
+- **Checks before every push.** prp holds a fix for approval instead of pushing it when it:
+  - changes more than 25 files or 800 lines
+  - touches `.github/workflows`, lockfiles, `.env*`, keys or `.npmrc`
+  - contains something that looks like a secret (built-in patterns, plus `gitleaks` if installed)
+  - would exceed 6 pushes to one PR in 24h
+
+  Held fixes show in `prp history`. Approve one with `prp push <id>` or drop it with `prp discard <id>`.
+  Set `push_mode: approve` to hold every fix.
 - **Everything is posted as you**, with a "🤖 via prp" footer. Reviews default to *pending* and mention
-  answers default to *draft*, so nothing reaches teammates until you decide.
+  answers default to *draft*, so nothing reaches teammates until you decide. prp never approves a PR.
+- **An agent that can't run** as configured (wrong model for your plan, logged out) is skipped for 6 hours
+  with a clear message, instead of being retried on every job.
 - Claude Code runs with `--permission-mode acceptEdits` plus a tool allowlist, never with
-  `--dangerously-skip-permissions`. Codex runs `--full-auto` for fixes and `--sandbox read-only` for reviews
-  and mentions.
+  `--dangerously-skip-permissions`. Codex runs with `--sandbox workspace-write` (network off) for fixes and
+  `--sandbox read-only` for reviews and mentions, never asking for approval.
 - Mention answers are told not to approve, commit to dates, or make decisions on your behalf.
 - Comments that existed before your first `prp run` are treated as already handled.
 - Fixes are skipped for PRs from forks, because prp only pushes to the repo it watches.
